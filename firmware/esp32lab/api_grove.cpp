@@ -78,6 +78,21 @@ static const SensorDef SENSORS[] = {
         "Connect CLK to D, DT to D2.",
         true, "CLK", "DT", "steps", nullptr
     },
+    {
+        "pc_fan", "PC Fan 12V (MOSFET)", "PC",
+        "12V (ATX)", false,
+        "12V fans switched by a low-side N-MOSFET behind an NPN inverter. The GPIO only drives "
+        "the NPN base through 1k, so it never sees more than 3.3V. Inverted logic: GPIO HIGH = fan off. "
+        "Fail-safe: when the ESP32 is off, rebooting or this sensor is not active, the fans run at 100%.",
+        false, "PWM (inverted)", nullptr, "%", nullptr
+    },
+    {
+        "argb", "ARGB LED Strip (WS2812)", "PC",
+        "5V (ATX)", false,
+        "5V addressable LEDs. Power the LEDs from the ATX 5V rail, never from the ESP32 5V/3.3V pin. "
+        "Data goes from D2 through a 74AHCT125 level shifter and 330 ohm. Common GND is required.",
+        true, "(fan, stays 100%)", "Data", "RGB", nullptr
+    },
 };
 #define SENSOR_COUNT (sizeof(SENSORS) / sizeof(SENSORS[0]))
 
@@ -97,6 +112,18 @@ static const int PWM_FREQ_DEFAULT = 1000;
 static const int PWM_RESOLUTION   = 8;
 static int pwmFreq = PWM_FREQ_DEFAULT;
 
+// PC fan: 25 kHz is above hearing; 8 bit duty, inverted (NPN stage)
+static const int FAN_PWM_FREQ   = 25000;
+static const unsigned long FAN_KICK_MS = 2000;   // 100 % when starting from standstill
+static int fanPct        = 100;   // requested speed
+static unsigned long fanKickUntil = 0;
+
+// ARGB (WS2812 / GRB) via RMT, 10 MHz tick = 100 ns
+static const int ARGB_MAX_LEDS = 300;
+static int argbCount = 24;
+static uint8_t argbR = 0, argbG = 0, argbB = 255;
+static bool argbReady = false;
+
 static volatile int rotarySteps = 0;
 static int lastCLK = LOW;
 
@@ -115,9 +142,62 @@ static const SensorDef* findSensor(const char* id) {
     return nullptr;
 }
 
+// ── PC fan ──────────────────────────────────────────────────────────────────
+static void fanApply(int pct) {
+    pct = constrain(pct, 0, 100);
+    // inverted: 0 % fan -> 255 (GPIO HIGH, NPN on, MOSFET off); 100 % -> 0
+    ledcWrite(groveD, 255 - (pct * 255 + 50) / 100);
+}
+
+static void fanSet(int pct) {
+    pct = constrain(pct, 0, 100);
+    bool startingFromStop = (fanPct == 0 && pct > 0);
+    fanPct = pct;
+    if (startingFromStop) {
+        fanKickUntil = millis() + FAN_KICK_MS;
+        fanApply(100);
+    } else if (fanKickUntil == 0) {
+        fanApply(pct);
+    }
+}
+
+// ── ARGB ────────────────────────────────────────────────────────────────────
+static void argbShow() {
+    if (!argbReady) return;
+    size_t n = (size_t)argbCount * 24;
+    rmt_data_t* buf = (rmt_data_t*)malloc(n * sizeof(rmt_data_t));
+    if (!buf) return;
+    const uint8_t grb[3] = { argbG, argbR, argbB };
+    size_t i = 0;
+    for (int led = 0; led < argbCount; led++) {
+        for (int c = 0; c < 3; c++) {
+            for (int bit = 7; bit >= 0; bit--) {
+                bool one = grb[c] & (1 << bit);
+                buf[i].level0    = 1;
+                buf[i].duration0 = one ? 8 : 4;   // 800 / 400 ns high
+                buf[i].level1    = 0;
+                buf[i].duration1 = one ? 4 : 8;   // 400 / 800 ns low
+                i++;
+            }
+        }
+    }
+    rmtWrite(groveD2, buf, n, RMT_WAIT_FOR_EVER);
+    free(buf);
+    delayMicroseconds(300);  // latch / reset (> 280 us for WS2812B v5)
+}
+
 static void teardownSensor() {
     if (!activeSensor) return;
     if (strcmp(activeSensor->id, "pwm_out") == 0) ledcDetach(groveD);
+    if (strcmp(activeSensor->id, "pc_fan") == 0) {
+        ledcDetach(groveD);
+        pinMode(groveD, INPUT);   // floating + 10k pull-down on NPN base -> fans 100 %
+        fanKickUntil = 0;
+    }
+    if (strcmp(activeSensor->id, "argb") == 0) {
+        rmtDeinit(groveD2);
+        argbReady = false;
+    }
     if (oneWire) { delete oneWire; oneWire = nullptr; }
     if (dallas)  { delete dallas;  dallas  = nullptr; }
     activeSensor = nullptr;
@@ -137,6 +217,15 @@ static void configureSensor(const SensorDef* s) {
         analogReadResolution(12);
     } else if (strcmp(s->id, "pwm_out") == 0) {
         ledcAttach(groveD, pwmFreq, PWM_RESOLUTION);
+    } else if (strcmp(s->id, "pc_fan") == 0) {
+        ledcAttach(groveD, FAN_PWM_FREQ, PWM_RESOLUTION);
+        fanPct = 100;
+        fanKickUntil = 0;
+        fanApply(100);
+    } else if (strcmp(s->id, "argb") == 0) {
+        pinMode(groveD, INPUT);   // fan pin released -> fans stay at 100 %
+        argbReady = rmtInit(groveD2, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, 10000000);
+        argbShow();
     } else if (strcmp(s->id, "dht11") == 0) {
         dht.setup(groveD, DHTesp::DHT11);
     } else if (strcmp(s->id, "ds18b20") == 0) {
@@ -227,6 +316,22 @@ static String takeReading() {
             lastCLK = clk;
         }
         doc["steps"] = rotarySteps;
+
+    } else if (strcmp(activeSensor->id, "pc_fan") == 0) {
+        doc["fan_pct"]  = fanPct;
+        doc["kick"]     = fanKickUntil != 0;
+        doc["duty"]     = 255 - (fanPct * 255 + 50) / 100;
+        doc["freq_hz"]  = FAN_PWM_FREQ;
+
+    } else if (strcmp(activeSensor->id, "argb") == 0) {
+        if (!argbReady) {
+            doc["error"] = "RMT init failed on this pin";
+        } else {
+            char hex[8];
+            snprintf(hex, sizeof(hex), "#%02x%02x%02x", argbR, argbG, argbB);
+            doc["color"] = hex;
+            doc["leds"]  = argbCount;
+        }
 
     } else if (strcmp(activeSensor->id, "digital_out") == 0 ||
                strcmp(activeSensor->id, "pwm_out")    == 0) {
@@ -367,6 +472,25 @@ void setupGroveApi() {
                 String json; serializeJson(resp, json);
                 req->send(200, "application/json", json);
 
+            } else if (strcmp(activeSensor->id, "pc_fan") == 0) {
+                fanSet(doc["pct"] | 100);
+                ApiServer::restRequestCount++;
+                JsonDocument resp;
+                resp["fan_pct"] = fanPct;
+                resp["duty"]    = 255 - (fanPct * 255 + 50) / 100;
+                String json; serializeJson(resp, json);
+                req->send(200, "application/json", json);
+
+            } else if (strcmp(activeSensor->id, "argb") == 0) {
+                argbR = constrain((int)(doc["r"] | 0), 0, 255);
+                argbG = constrain((int)(doc["g"] | 0), 0, 255);
+                argbB = constrain((int)(doc["b"] | 0), 0, 255);
+                if (doc.containsKey("count"))
+                    argbCount = constrain((int)doc["count"], 1, ARGB_MAX_LEDS);
+                argbShow();
+                ApiServer::restRequestCount++;
+                ApiServer::sendOk(req, "argb");
+
             } else {
                 ApiServer::sendError(req, 400, "Active sensor is not an output type");
             }
@@ -425,6 +549,11 @@ void setupGroveApi() {
 // ============================================================================
 
 void groveLoop() {
+    if (fanKickUntil && activeSensor && strcmp(activeSensor->id, "pc_fan") == 0 &&
+        (long)(millis() - fanKickUntil) >= 0) {
+        fanKickUntil = 0;
+        fanApply(fanPct);
+    }
     if (!activeSensor || !groveEvents) return;
     if (groveEvents->count() == 0)     return;
 

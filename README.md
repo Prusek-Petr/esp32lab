@@ -49,6 +49,8 @@ So: **one codebase, one `master` branch** — but you must flash the binary that
 | DS18B20 | Waterproof temperature probe |
 | HC-SR04P | Ultrasonic distance |
 | Rotary Encoder | Turn count + direction (KY-040) |
+| PC Fan 12V (MOSFET) | 3-pin 12V PC fans, 0–100 % via low-side MOSFET + NPN inverter (25 kHz, fail-safe 100 %) |
+| ARGB LED Strip | WS2812 / 5V ARGB colour + LED count via RMT on D2 (74AHCT125 level shifter) |
 
 **WiFi provisioning (no reflash required):**
 - First boot creates an `ESP32Lab` hotspot
@@ -184,6 +186,7 @@ MANUAL.md             End-user kit manual
 
 | Version | Changes |
 |---------|---------|
+| 1.11.0 | PC Fan (MOSFET, inverted fail-safe PWM, kick-start) and ARGB LED Strip sensors with schematic wiring guides |
 | 1.6.0 | Runtime board self-detection, configurable LED pin via UI, dynamic GPIO safe-pin list, unified build.bat, single master branch |
 | 1.5.0 | Device naming (NVS, MAC-based default), LED identify button, asset caching with version-based cache busting |
 | 1.4.0 | WiFi network scan in provisioning UI |
